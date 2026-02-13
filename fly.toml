@@ -1,23 +1,32 @@
-# fly.toml app configuration file generated for thevideo on 2026-02-13T00:10:27Z
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
+# fly.toml — configuration optimale pour API Flask pass-through TikTok
 
-app = 'thevideo'
-primary_region = 'ams'
+app = "istheaudio"
+primary_region = "iad"
 
 [build]
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = 'stop'
+
+  # Démarrage automatique à la demande
   auto_start_machines = true
+  auto_stop_machines = "stop"
+
+  # Aucune machine active sans trafic
   min_machines_running = 0
-  processes = ['app']
+
+  processes = ["app"]
+
+  # IMPORTANT pour streaming vidéo
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
 
 [[vm]]
-  memory = '1gb'
-  cpu_kind = 'shared'
+  cpu_kind = "shared"
   cpus = 1
-  memory_mb = 256
+
+  # RAM suffisante pour yt-dlp + streaming
+  memory = "512mb"
