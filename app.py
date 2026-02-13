@@ -1,12 +1,12 @@
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
-import re
 import subprocess
+import tempfile
 import os
 import sys
+import re
+import shutil
 import psycopg2
-import requests
-import yt_dlp
 import jwt
 from jwt import PyJWKClient
 from datetime import datetime, timezone
@@ -74,15 +74,13 @@ def verify_jwt_and_get_user():
 
     try:
         signing_key = get_jwk_client().get_signing_key_from_jwt(token)
-
         payload = jwt.decode(
             token,
             signing_key.key,
-            algorithms=["ES256"],   # Supabase utilise ES256
+            algorithms=["ES256"],   # Supabase utilise ES256 pour EC keys
             audience=JWT_AUDIENCE,
             issuer=JWT_ISSUER,
         )
-
         user_id = payload.get("sub")
         app.logger.info(f"✅ JWT verified user_id={user_id}")
         return user_id
@@ -114,28 +112,12 @@ def increment_usage(user_id):
 def is_valid_tiktok_url(url: str) -> bool:
     return bool(re.search(r"(vm\.tiktok\.com|tiktok\.com)", url))
 
-def extract_info_and_filesize(url: str):
-    ydl_opts = {
-        "quiet": True,
-        "skip_download": True,
-        "nocheckcertificate": True,
-        "user_agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 "
-            "Mobile/15E148 Safari/604.1"
-        ),
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-    filesize = info.get("filesize") or info.get("filesize_approx")
-    return info, filesize
-
 # -----------------------------
-# STREAM ENDPOINT
+# AUDIO STREAM ENDPOINT → MP3
 # -----------------------------
-@app.route("/tiktok/stream", methods=["POST", "OPTIONS"])
-def tiktok_stream():
-    app.logger.info("➡️ /tiktok/stream called")
+@app.route("/tiktok/mp3", methods=["POST", "OPTIONS"])
+def tiktok_mp3():
+    app.logger.info("➡️ /tiktok/mp3 called")
 
     if request.method == "OPTIONS":
         return "", 200
@@ -160,67 +142,82 @@ def tiktok_stream():
     if not data or "url" not in data:
         return jsonify({"error": "Missing url"}), 400
 
-    url = data["url"]
+    url = data["url"].strip()
     if not is_valid_tiktok_url(url):
         return jsonify({"error": "Invalid TikTok URL"}), 400
 
-    # Récupération taille pour progression UI
+    temp_dir = tempfile.mkdtemp(prefix="tiktok_mp3_")
+    video_path = os.path.join(temp_dir, "video.mp4")
+    audio_path = os.path.join(temp_dir, "audio.mp3")
+
     try:
-        info, filesize = extract_info_and_filesize(url)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-    if not filesize:
-        return jsonify({"error": "Unable to determine file size"}), 500
-
-    def generate():
-        app.logger.info("🎬 Starting yt-dlp streaming")
-        cmd = [
-            sys.executable,
-            "-m", "yt_dlp",
-            "-f", "bv*[ext=mp4][watermark!=true]/b[ext=mp4]",
-            "-o", "-",
-            "--merge-output-format", "mp4",
-            "--no-part",
-            "--quiet",
-            url,
-        ]
-
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
+        # 1️⃣ Télécharger la vidéo
+        subprocess.run(
+            [
+                sys.executable, "-m", "yt_dlp",
+                "-f", "bv*+ba/b",
+                "--merge-output-format", "mp4",
+                "--no-part",
+                "--no-playlist",
+                "--quiet",
+                "-o", video_path,
+                url,
+            ],
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            bufsize=1024 * 1024,
+            check=True,
         )
 
-        try:
-            received_bytes = 0
-            while True:
-                chunk = process.stdout.read(8192)
-                if not chunk:
-                    break
-                received_bytes += len(chunk)
-                yield chunk
-        finally:
-            stderr = process.stderr.read().decode()
-            process.stdout.close()
-            process.stderr.close()
-            process.wait()
-            if process.returncode != 0:
-                app.logger.error(f"❌ yt-dlp error: {stderr}")
-            else:
-                app.logger.info("✅ Stream finished")
+        if not os.path.exists(video_path) or os.path.getsize(video_path) < 1024:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return jsonify({"error": "Downloaded video is empty"}), 500
 
-    return Response(
-        stream_with_context(generate()),
-        content_type="video/mp4",
-        headers={
-            "Content-Disposition": "attachment; filename=tiktok.mp4",
-            "Content-Length": str(filesize),  # ← indispensable pour Flutter progression
-            "Cache-Control": "no-store",
-            "Accept-Ranges": "none",
-        },
-    )
+        # 2️⃣ Extraire en MP3
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", video_path,
+                "-vn", "-acodec", "libmp3lame", "-ab", "192k",
+                audio_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+
+        if not os.path.exists(audio_path) or os.path.getsize(audio_path) < 1024:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return jsonify({"error": "MP3 extraction failed"}), 409
+
+        mp3_size = os.path.getsize(audio_path)
+
+        def generate():
+            try:
+                with open(audio_path, "rb") as f:
+                    while True:
+                        chunk = f.read(8192)
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+        return Response(
+            stream_with_context(generate()),
+            content_type="audio/mpeg",
+            headers={
+                "Content-Disposition": "attachment; filename=tiktok_audio.mp3",
+                "Content-Length": str(mp3_size),
+                "Cache-Control": "no-store",
+                "Accept-Ranges": "none",
+            },
+        )
+
+    except subprocess.CalledProcessError as e:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return jsonify({
+            "error": "Video download or MP3 encoding failed",
+            "details": e.stderr.decode(errors="ignore"),
+        }), 500
 
 # -----------------------------
 # HEALTH
@@ -235,6 +232,8 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, threaded=True)
+
+
 
 
 
