@@ -27,7 +27,7 @@ def add_headers(response):
     return response
 
 # --------------------------------------------------
-# CONFIG
+# CONFIG (Fly.io secrets)
 # --------------------------------------------------
 DB_URL = os.environ["SUPABASE_DB_URL"]
 JWKS_URL = os.environ["SUPABASE_JWKS_URL"]
@@ -37,7 +37,7 @@ JWT_AUDIENCE = os.environ.get("SUPABASE_JWT_AUDIENCE", "authenticated")
 QUOTA_PER_HOUR = 30
 
 # --------------------------------------------------
-# GLOBALS
+# GLOBALS (lazy init)
 # --------------------------------------------------
 db_pool: pool.SimpleConnectionPool | None = None
 jwk_client: PyJWKClient | None = None
@@ -51,7 +51,7 @@ def init_db_pool():
         app.logger.info("🔌 Initializing PostgreSQL connection pool")
         db_pool = pool.SimpleConnectionPool(
             minconn=1,
-            maxconn=20,   # SAFE for Supabase Free + Fly scaling
+            maxconn=20,  # SAFE: Supabase Free (60) / 2 Fly machines / streaming
             dsn=DB_URL,
         )
     return db_pool
@@ -81,8 +81,10 @@ def verify_jwt_and_get_user():
         return None
 
     token = auth.split(" ", 1)[1]
+
     try:
         signing_key = get_jwk_client().get_signing_key_from_jwt(token)
+
         payload = jwt.decode(
             token,
             signing_key.key,
@@ -90,9 +92,11 @@ def verify_jwt_and_get_user():
             audience=JWT_AUDIENCE,
             issuer=JWT_ISSUER,
         )
+
         user_id = payload["sub"]
         app.logger.info(f"✅ JWT verified user_id={user_id}")
         return user_id
+
     except Exception as e:
         app.logger.error(f"❌ JWT verification failed: {e}")
         return None
@@ -128,6 +132,8 @@ def is_valid_tiktok_url(url: str) -> bool:
 # --------------------------------------------------
 @app.route("/tiktok/mp3", methods=["POST", "OPTIONS"])
 def tiktok_mp3():
+    app.logger.info("➡️ /tiktok/mp3 called")
+
     if request.method == "OPTIONS":
         return "", 200
 
@@ -143,7 +149,7 @@ def tiktok_mp3():
         return jsonify({
             "error": "Quota exceeded",
             "limit": QUOTA_PER_HOUR,
-            "reset_at": reset_at.isoformat()
+            "reset_at": reset_at.isoformat(),
         }), 429
 
     data = request.get_json(silent=True)
@@ -234,6 +240,7 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, threaded=True)
+
 
 
 
